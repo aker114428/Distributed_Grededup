@@ -35,24 +35,10 @@ type SuperChunk struct {
 
 // Chunk 结构体：表示一个文件块
 type Chunk struct {
-	Offset int64  `json:"offset"` // 块在文件中的偏移量
-	Hash   string `json:"hash"`   // 块的哈希值
-	Data   []byte `json:"data"`   // 块的二进制数据
-}
-
-// SuperChunkRequest 结构体：用于路由请求的超级块信息
-type SuperChunkRequest struct {
-	FileHash             string         `json:"fileHash"`             //该超级块归属于哪个文件（用hash表示）
-	Chunks               []ChunkRequest `json:"chunks"`               // 超级块中包含的块列表（不包含数据）
-	RepresentativeHashes []string       `json:"representativeHashes"` // 超级块的代表性哈希值列表
-	FileType             string         `json:"fileType"`             // 文件类型
-	StorageURL           string         `json:"StorageURL"`
-}
-
-// ChunkRequest 结构体：用于路由请求的块信息（不包含数据）
-type ChunkRequest struct {
-	Offset int64  `json:"offset"` // 块在文件中的偏移量
-	Hash   string `json:"hash"`   // 块的哈希值
+	Offset      int64  `json:"offset"`      // 块在文件中的偏移量
+	Hash        string `json:"hash"`        // 块的哈希值
+	Data        []byte `json:"data"`        // 块的二进制数据
+	IsDuplicate bool   `json:"isDuplicate"` // 块是否已存在
 }
 
 // getWLANIP 获取本机的 IP 地址（支持无线网络和有线网络）
@@ -116,20 +102,20 @@ func calculateTotalStorageSize() (int64, error) {
 		return 0, nil
 	}
 
-	var totalSize int64
+	var totalDataSize int64
 	err := filepath.Walk(storageDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() {
-			totalSize += info.Size()
+			totalDataSize += info.Size()
 		}
 		return nil
 	})
 	if err != nil {
 		return 0, fmt.Errorf("计算存储大小失败: %v", err)
 	}
-	return totalSize, nil
+	return totalDataSize, nil
 }
 
 // 向元数据服务器注册自己
@@ -154,7 +140,7 @@ func registerWithMetadataServer() error {
 	}
 
 	// 计算当前存储的块总大小
-	totalSize, err := calculateTotalStorageSize()
+	totalDataSize, err := calculateTotalStorageSize()
 	if err != nil {
 		return fmt.Errorf("计算存储大小失败: %v", err)
 	}
@@ -163,7 +149,7 @@ func registerWithMetadataServer() error {
 	localURL = "http://" + ip + dataNodePort
 	nodeInfo := map[string]interface{}{
 		"url":      localURL, // 数据节点的 URL
-		"dataSize": totalSize,
+		"dataSize": totalDataSize,
 	}
 	jsonData, err := json.Marshal(nodeInfo)
 	if err != nil {
@@ -194,21 +180,23 @@ func registerWithMetadataServer() error {
 
 // StorageServer 结构体：存储服务器，负责存储块
 type StorageServer struct {
-	mu sync.Mutex // 互斥锁
+	mu            sync.Mutex // 互斥锁
+	TotalDataSize int64
+	FileTypes     map[string]struct{} //用map模拟集合,存储文件类型
 }
 
-// storeChunks 函数：将块存储到存储服务器
-func (s *StorageServer) storeChunks(w http.ResponseWriter, r *http.Request) {
-	var totalSize int64 = 0
-	var requestBody struct {
-		Chunks []struct {
-			Offset int64  `json:"offset"`
-			Hash   string `json:"hash"`
-			Data   []byte `json:"data"`
-		} `json:"chunks"`
-		FileType string `json:"fileType"`
+// NewStorageServer 函数：初始存储服务器
+func NewStorageServer() *StorageServer {
+	return &StorageServer{
+		TotalDataSize: 0,
+		FileTypes:     make(map[string]struct{}),
 	}
-	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+}
+
+// storeSuperChunks 函数：将块存储到存储服务器
+func (s *StorageServer) storeSuperChunks(w http.ResponseWriter, r *http.Request) {
+	var superChunk SuperChunk
+	if err := json.NewDecoder(r.Body).Decode(&superChunk); err != nil {
 		http.Error(w, "解析请求体失败", http.StatusBadRequest)
 		return
 	}
@@ -217,39 +205,48 @@ func (s *StorageServer) storeChunks(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	// 将块存储到对应类型的文件夹中
-	for _, chunk := range requestBody.Chunks {
-		totalSize += int64(len(chunk.Data))
-		dir := filepath.Join(storageDir, requestBody.FileType)
+	for _, chunk := range superChunk.Chunks {
+		if chunk.IsDuplicate {//这里重复检查的只有代表指纹
+			continue
+		}
+		dir := filepath.Join(storageDir, superChunk.FileType)
 		if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 			log.Printf("创建目录 %s 失败: %v\n", dir, err)
 			http.Error(w, "创建目录失败", http.StatusInternalServerError)
 			return
 		}
+		s.FileTypes[superChunk.FileType] = struct{}{}
 
 		filePath := filepath.Join(dir, chunk.Hash)
+		// 检查指纹是否已存在
+		if _, err := os.Stat(filePath); err == nil {
+			//log.Printf("块 %s 已存在，跳过写入\n", filePath)
+			// 如果不想覆盖，就 continue
+			continue
+		} else if !os.IsNotExist(err) {
+			log.Printf("检查文件 %s 出错: %v\n", filePath, err)
+			http.Error(w, "检查文件失败", http.StatusInternalServerError)
+			return
+		}
+
+		// 文件不存在，写入数据
 		if err := os.WriteFile(filePath, chunk.Data, 0644); err != nil {
 			log.Printf("写入块 %s 失败: %v\n", filePath, err)
 			http.Error(w, "写入块失败", http.StatusInternalServerError)
 			return
 		}
+		s.TotalDataSize += int64(len(chunk.Data))
 	}
 
 	// 返回存储后的 data_blocks 大小
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(struct {
-		TotalSize int64 `json:"totalSize"`
-	}{
-		TotalSize: totalSize,
-	})
 }
 
-// checkChunks 函数：根据文件类型，在对应文件夹下检查哈希匹配数量，并返回重复的哈希值
-func (s *StorageServer) checkChunks(w http.ResponseWriter, r *http.Request) {
-	var requestBody struct {
-		FileType string   `json:"fileType"`
-		Hashes   []string `json:"hashes"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+// checkSuperChunks 函数：根据文件类型，在对应文件夹下检查哈希匹配数量，并返回重复的哈希值
+func (s *StorageServer) checkSuperChunks(w http.ResponseWriter, r *http.Request) {
+	var superChunk SuperChunk
+	matchCount := 0
+	if err := json.NewDecoder(r.Body).Decode(&superChunk); err != nil {
 		http.Error(w, "解析请求体失败", http.StatusBadRequest)
 		return
 	}
@@ -258,23 +255,23 @@ func (s *StorageServer) checkChunks(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	// 在对应文件类型的文件夹下检查哈希匹配
-	var duplicateHashes []string
-	dir := filepath.Join(storageDir, requestBody.FileType)
-	for _, hash := range requestBody.Hashes {
-		filePath := filepath.Join(dir, hash)
+	dir := filepath.Join(storageDir, superChunk.FileType)
+	for i := 0; i < len(superChunk.RepresentativeHashes); i++ { //RepresentativeHashes就是取超块中的前len(RepresentativeHashes)个块
+		filePath := filepath.Join(dir, superChunk.Chunks[i].Hash)
 		if _, err := os.Stat(filePath); err == nil {
-			duplicateHashes = append(duplicateHashes, hash)
+			matchCount++
+			superChunk.Chunks[i].IsDuplicate = true
 		}
 	}
 
 	// 返回匹配的哈希数量和重复的哈希值
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(struct {
-		MatchCount      int      `json:"matchCount"`
-		DuplicateHashes []string `json:"duplicateHashes"`
+		MatchCount int        `json:"matchCount"`
+		SuperChunk SuperChunk `json:"superChunk"`
 	}{
-		MatchCount:      len(duplicateHashes),
-		DuplicateHashes: duplicateHashes,
+		MatchCount: matchCount,
+		SuperChunk: superChunk,
 	})
 }
 
@@ -283,6 +280,8 @@ func (s *StorageServer) clean(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.FileTypes = make(map[string]struct{})
+	s.TotalDataSize = 0
 	// 删除存储目录及其所有内容
 	if err := os.RemoveAll("./data_blocks"); err != nil {
 		http.Error(w, fmt.Sprintf("清除存储目录失败: %v", err), http.StatusInternalServerError)
@@ -297,6 +296,7 @@ func (s *StorageServer) clean(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "存储数据已清除")
+	fmt.Println("data cleared successfully")
 }
 
 // getStorageInfo 函数：计算 storageDir 下存储的数据总大小和数据类型
@@ -308,20 +308,48 @@ func (s *StorageServer) getStorageInfo(w http.ResponseWriter, r *http.Request) {
 	if _, err := os.Stat(storageDir); os.IsNotExist(err) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(struct {
-			TotalSize int64    `json:"totalSize"`
-			FileTypes []string `json:"fileTypes"`
+			TotalDataSize int64    `json:"totalDataSize"`
+			FileTypes     []string `json:"fileTypes"`
 		}{
-			TotalSize: 0,
-			FileTypes: []string{},
+			TotalDataSize: 0,
+			FileTypes:     []string{},
 		})
 		return
 	}
 
+	// 将 map 转换为 slice
+	var types []string
+	for fileType := range s.FileTypes {
+		types = append(types, fileType)
+	}
+	fmt.Printf("总数据大小：%dMB\n", s.TotalDataSize/1024/1024)
+	fmt.Println("存储文件类型：", types)
+	// 返回总大小和数据类型
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(struct {
+		TotalDataSize int64    `json:"totalDataSize"`
+		FileTypes     []string `json:"fileTypes"`
+	}{
+		TotalDataSize: s.TotalDataSize,
+		FileTypes:     types,
+	})
+}
+
+func initStorageServer(s *StorageServer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 检查存储目录是否存在
+	if _, err := os.Stat(storageDir); os.IsNotExist(err) {
+
+		return
+	}
+
 	// 计算存储目录下所有文件的总大小和数据类型
-	var totalSize int64
-	fileTypes := make(map[string]bool) // 使用 map 去重
+	var totalDataSize int64
+	fileTypes := make(map[string]struct{}) // 使用 map 去重
 
 	err := filepath.Walk(storageDir, func(path string, info os.FileInfo, err error) error {
+
 		if err != nil {
 			return err
 		}
@@ -331,19 +359,19 @@ func (s *StorageServer) getStorageInfo(w http.ResponseWriter, r *http.Request) {
 			// 获取文件夹名称（例如 ".png"）
 			folderName := filepath.Base(path)
 			if folderName != "" {
-				fileTypes[folderName] = true
+				fileTypes[folderName] = struct{}{}
 			}
 		}
 
 		// 如果是文件，累加文件大小
 		if !info.IsDir() {
-			totalSize += info.Size()
+			totalDataSize += info.Size()
 		}
 
 		return nil
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("计算存储大小失败: %v", err), http.StatusInternalServerError)
+		fmt.Printf("计算存储大小失败: %v", err)
 		return
 	}
 
@@ -352,20 +380,15 @@ func (s *StorageServer) getStorageInfo(w http.ResponseWriter, r *http.Request) {
 	for fileType := range fileTypes {
 		types = append(types, fileType)
 	}
+	fmt.Printf("总数据大小：%dMB\n", totalDataSize/1024/1024)
+	fmt.Println("存储文件类型：", types)
 
-	// 返回总大小和数据类型
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(struct {
-		TotalSize int64    `json:"totalSize"`
-		FileTypes []string `json:"fileTypes"`
-	}{
-		TotalSize: totalSize,
-		FileTypes: types,
-	})
+	s.TotalDataSize = totalDataSize
+	s.FileTypes = fileTypes
+
 }
 
 func cleanup() error {
-	fmt.Println("执行清理操作...")
 
 	// 构造请求体
 	requestBody := map[string]string{
@@ -388,58 +411,14 @@ func cleanup() error {
 		return fmt.Errorf("clear request failed with status: %s", resp.Status)
 	}
 
-	fmt.Println("Metadata server data cleared successfully")
+	fmt.Println("data cleared successfully")
 	return nil
-}
-
-// getChunk 函数：根据哈希值获取块数据
-func (s *StorageServer) getChunk(w http.ResponseWriter, r *http.Request) {
-	// 解析请求体
-	var requestBody struct {
-		Hash string `json:"hash"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
-		http.Error(w, "解析请求体失败", http.StatusBadRequest)
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 遍历所有文件类型文件夹，查找块数据
-	dirs, err := os.ReadDir(storageDir)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("读取存储目录失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	for _, dir := range dirs {
-		if dir.IsDir() {
-			filePath := filepath.Join(storageDir, dir.Name(), requestBody.Hash)
-			if _, err := os.Stat(filePath); err == nil {
-				// 读取块数据
-				chunkData, err := os.ReadFile(filePath)
-				if err != nil {
-					http.Error(w, fmt.Sprintf("读取块数据失败: %v", err), http.StatusInternalServerError)
-					return
-				}
-
-				// 返回块数据
-				w.WriteHeader(http.StatusOK)
-				w.Write(chunkData)
-				return
-			}
-		}
-	}
-
-	// 如果未找到块数据，返回 404
-	http.Error(w, "块数据不存在", http.StatusNotFound)
 }
 
 // getSuperChunk 函数：根据哈希值获取块数据
 func (s *StorageServer) getSuperChunk(w http.ResponseWriter, r *http.Request) {
 	// 解析请求体
-	var superChunk SuperChunkRequest
+	var superChunk SuperChunk
 	if err := json.NewDecoder(r.Body).Decode(&superChunk); err != nil {
 		http.Error(w, "解析请求体失败", http.StatusBadRequest)
 		return
@@ -477,6 +456,9 @@ func (s *StorageServer) getSuperChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	storageServer := NewStorageServer()
+	initStorageServer(storageServer)
+
 	// 捕获退出信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -516,12 +498,11 @@ func main() {
 	}
 
 	// 启动存储服务器
-	storageServer := &StorageServer{}
-	http.HandleFunc("/storeChunks", storageServer.storeChunks)
-	http.HandleFunc("/checkChunks", storageServer.checkChunks)
+
+	http.HandleFunc("/storeSuperChunks", storageServer.storeSuperChunks)
+	http.HandleFunc("/checkSuperChunks", storageServer.checkSuperChunks)
 	http.HandleFunc("/getStorageInfo", storageServer.getStorageInfo)
 	http.HandleFunc("/clean", storageServer.clean)
-	http.HandleFunc("/getChunk", storageServer.getChunk)
 	http.HandleFunc("/getSuperChunk", storageServer.getSuperChunk)
 
 	fmt.Printf("存储服务器运行在端口 %s...\n", dataNodePort)

@@ -29,7 +29,19 @@ var (
 	absoluteDedupRatio        = 1.0 //绝对重删率
 	oneNodeAbsoluteDedupRatio = 1.0 //单节点绝对重删率：重删前文件总大小除以重删后文件总大小
 	relativeDedupRatio        = 1.0 //多节点相对重删率：多节点绝对重删率除以单节点系统的绝对重删率
+	mu                        sync.Mutex
 )
+
+// 全局 HTTP 客户端，带超时与连接复用
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 
 // FileInfo 结构体：存储文件的基本信息和分块信息
 type FileInfo struct {
@@ -51,24 +63,10 @@ type SuperChunk struct {
 
 // Chunk 结构体：表示一个文件块
 type Chunk struct {
-	Offset int64  `json:"offset"` // 块在文件中的偏移量
-	Hash   string `json:"hash"`   // 块的哈希值
-	Data   []byte `json:"data"`   // 块的二进制数据
-}
-
-// SuperChunkRequest 结构体：用于路由请求的超级块信息
-type SuperChunkRequest struct {
-	FileHash             string         `json:"fileHash"`             //该超级块归属于哪个文件（用hash表示）
-	Chunks               []ChunkRequest `json:"chunks"`               // 超级块中包含的块列表（不包含数据）
-	RepresentativeHashes []string       `json:"representativeHashes"` // 超级块的代表性哈希值列表
-	FileType             string         `json:"fileType"`             // 文件类型
-	StorageURL           string         `json:"StorageURL"`
-}
-
-// ChunkRequest 结构体：用于路由请求的块信息（不包含数据）
-type ChunkRequest struct {
-	Offset int64  `json:"offset"` // 块在文件中的偏移量
-	Hash   string `json:"hash"`   // 块的哈希值
+	Offset      int64  `json:"offset"`      // 块在文件中的偏移量
+	Hash        string `json:"hash"`        // 块的哈希值
+	Data        []byte `json:"data"`        // 块的二进制数据
+	IsDuplicate bool   `json:"isDuplicate"` // 块是否已存在
 }
 
 // StorageInfo 结构体：存储服务器的存储信息
@@ -154,9 +152,10 @@ func preprocessFile(fileName string, fileData []byte) (FileInfo, error) {
 	var currentSuperChunk SuperChunk
 	for i, chunkData := range chunksData {
 		chunk := Chunk{
-			Offset: int64(i),
-			Hash:   computeHash(chunkData),
-			Data:   chunkData, // 存储块的二进制数据
+			Offset:      int64(i),
+			Hash:        computeHash(chunkData),
+			Data:        chunkData, // 存储块的二进制数据
+			IsDuplicate: false,
 		}
 
 		// 将块添加到当前超级块中
@@ -167,6 +166,10 @@ func preprocessFile(fileName string, fileData []byte) (FileInfo, error) {
 		currentSuperChunk.StorageURL = ""
 		// 检查是否满足生成超级块的条件
 		if len(currentSuperChunk.Chunks) >= 30 && (len(currentSuperChunk.Chunks) == 40 || i == len(chunksData)-1 || hexToInt(chunk.Hash)%4 == 0) {
+			// 创建一个长度为 8 的切片,代表指纹集只含8个指纹
+			slice := make([]string, 8)
+			copy(slice, currentSuperChunk.RepresentativeHashes[:8])
+			currentSuperChunk.RepresentativeHashes = slice
 			fileInfo.SuperChunks = append(fileInfo.SuperChunks, currentSuperChunk)
 			currentSuperChunk = SuperChunk{} // 重置当前超级块
 		}
@@ -174,16 +177,56 @@ func preprocessFile(fileName string, fileData []byte) (FileInfo, error) {
 
 	// 如果最后几个块未满足条件，生成一个超级块
 	if len(currentSuperChunk.Chunks) > 0 {
+		if len(currentSuperChunk.RepresentativeHashes) > 8 {
+			slice := make([]string, 8)
+			copy(slice, currentSuperChunk.RepresentativeHashes[:8])
+			currentSuperChunk.RepresentativeHashes = slice
+		}
 		fileInfo.SuperChunks = append(fileInfo.SuperChunks, currentSuperChunk)
 	}
 
 	return fileInfo, nil
 }
 
-// sendFileInfo 函数：发送文件信息到元数据服务器，检查文件是否重复
-func sendFileInfo(fileInfo FileInfo) bool {
-	url := metadataServerURL + "/checkFileDuplicate"
-	jsonData, err := json.Marshal(fileInfo)
+// sendFileInfo 函数：发送文件信息到元数据服务器，检查文件是否重复,若不重复则进行路由获取存储位置url
+func sendFileInfo(fileInfoWithData FileInfo) (bool, FileInfo) {
+	url := metadataServerURL + "/processFileInfo"
+
+	// 构造 fileInfoWithoutData，用于只发送元数据，不包含 Chunk 的实际数据
+	fileInfoWithoutData := FileInfo{
+		Name: fileInfoWithData.Name, // 文件名
+		Size: fileInfoWithData.Size, // 文件大小
+		Type: fileInfoWithData.Type, // 文件类型
+		Hash: fileInfoWithData.Hash, // 文件哈希
+	}
+
+	// 遍历原始文件中的所有超级块
+	for _, sc := range fileInfoWithData.SuperChunks {
+		// 创建一个新的超级块结构体，拷贝元数据信息
+		newSuperChunk := SuperChunk{
+			FileHash:             sc.FileHash,                                       // 所属文件的哈希
+			RepresentativeHashes: append([]string(nil), sc.RepresentativeHashes...), // 拷贝指纹集
+			FileType:             sc.FileType,                                       // 文件类型
+			StorageURL:           sc.StorageURL,                                     // 存储地址（可为空）
+		}
+
+		// 遍历该超级块中的所有 Chunk
+		for _, chunk := range sc.Chunks {
+			// 创建一个新的 Chunk，拷贝元数据，不保留 Data 数据
+			newChunk := Chunk{
+				Offset:      chunk.Offset,      // 块偏移
+				Hash:        chunk.Hash,        // 块哈希
+				IsDuplicate: chunk.IsDuplicate, // 是否为重复块
+				Data:        []byte{},          // 清空实际数据，节省传输
+			}
+			newSuperChunk.Chunks = append(newSuperChunk.Chunks, newChunk)
+		}
+
+		// 将新的超级块加入目标结构体中
+		fileInfoWithoutData.SuperChunks = append(fileInfoWithoutData.SuperChunks, newSuperChunk)
+	}
+
+	jsonData, err := json.Marshal(fileInfoWithoutData)
 	if err != nil {
 		log.Fatal("Failed to marshal file info:", err)
 	}
@@ -194,116 +237,113 @@ func sendFileInfo(fileInfo FileInfo) bool {
 	}
 	defer resp.Body.Close()
 
-	var isDuplicate bool
-	json.NewDecoder(resp.Body).Decode(&isDuplicate)
-	return isDuplicate
-}
-
-// routeSuperChunk 函数：路由超级块到存储服务器，并返回最佳节点和非重复块的哈希值
-func routeSuperChunk(superChunk SuperChunk) (string, []string) {
-	// 将 SuperChunk 转换为 SuperChunkRequest，防止传输块的二进制数据浪费带宽
-	superChunkRequest := SuperChunkRequest{
-		FileHash:             superChunk.FileHash,
-		Chunks:               make([]ChunkRequest, len(superChunk.Chunks)),
-		RepresentativeHashes: superChunk.RepresentativeHashes,
-		FileType:             superChunk.FileType,
-		StorageURL:           superChunk.StorageURL,
+	var fileInfoWithUrl FileInfo
+	var isDuplicate bool = false
+	//解析元数据服务器响应
+	json.NewDecoder(resp.Body).Decode(&fileInfoWithUrl)
+	if fileInfoWithUrl.Name == "isDuplicate" {
+		isDuplicate = true
+		return isDuplicate, FileInfo{}
 	}
-	for i, chunk := range superChunk.Chunks {
-		superChunkRequest.Chunks[i] = ChunkRequest{
-			Offset: chunk.Offset,
-			Hash:   chunk.Hash,
-		}
-	}
-
-	// 发送路由请求
-	url := metadataServerURL + "/routeSuperChunk"
-	jsonData, err := json.Marshal(superChunkRequest)
-	if err != nil {
-		log.Fatal("Failed to marshal super chunk request:", err)
-	}
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Fatal("Failed to route super chunk:", err)
-	}
-	defer resp.Body.Close()
-
-	// 解析响应
-	var result struct {
-		StorageURL         string   `json:"storageURL"`
-		NonDuplicateHashes []string `json:"nonDuplicateHashes"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Fatal("Failed to decode response:", err)
-	}
-
-	return result.StorageURL, result.NonDuplicateHashes
-}
-
-// storeChunks 函数：将非重复块存储到存储服务器
-func storeChunks(storageURL string, chunks []Chunk, nonDuplicateHashes []string, fileType string) int64 {
-	// 过滤需要存储的块
-	var chunksToStore []Chunk
-	for _, chunk := range chunks {
-		for _, hash := range nonDuplicateHashes {
-			if chunk.Hash == hash {
-				chunksToStore = append(chunksToStore, chunk)
-				break
+	//更新超级块的url和是否重复信息
+	for i := range fileInfoWithUrl.SuperChunks {
+		fileInfoWithData.SuperChunks[i].StorageURL = fileInfoWithUrl.SuperChunks[i].StorageURL
+		for j := range fileInfoWithUrl.SuperChunks[i].Chunks {
+			fileInfoWithData.SuperChunks[i].Chunks[j].IsDuplicate = fileInfoWithUrl.SuperChunks[i].Chunks[j].IsDuplicate
+			if fileInfoWithData.SuperChunks[i].Chunks[j].IsDuplicate {
+				fileInfoWithData.SuperChunks[i].Chunks[j].Data = []byte{}
 			}
 		}
 	}
+	return isDuplicate, fileInfoWithData
+}
 
-	// 将文件类型与块数据一起发送到存储服务器
-	requestBody := struct {
-		Chunks   []Chunk `json:"chunks"`
-		FileType string  `json:"fileType"`
-	}{
-		Chunks:   chunksToStore,
-		FileType: fileType,
-	}
-
-	jsonData, err := json.Marshal(requestBody)
+// 上传一个超级块，带重试机制
+func uploadSuperChunkWithRetry(sc SuperChunk, maxRetries int) error {
+	jsonData, err := json.Marshal(sc)
 	if err != nil {
-		log.Fatal("Failed to marshal chunks:", err)
+		return fmt.Errorf("序列化失败: %v", err)
 	}
 
-	// 发送请求到存储服务器
-	url := fmt.Sprintf("%s/storeChunks", storageURL)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Fatal("Failed to store chunks:", err)
-	}
-	defer resp.Body.Close()
+	url := fmt.Sprintf("%s/storeSuperChunks", sc.StorageURL)
 
-	// 解析响应，获取存储后的 data_blocks 大小
-	var result struct {
-		TotalSize int64 `json:"totalSize"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Fatal("Failed to decode response:", err)
+	for attempt := 1; attempt <= maxRetries+1; attempt++ {
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return fmt.Errorf("创建请求失败: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return nil
+		}
+
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		log.Printf("上传失败 [第 %d 次重试] [%s]: %v", attempt, sc.FileHash, err)
+
+		// 如果还有机会重试，休眠一下
+		if attempt <= maxRetries {
+			time.Sleep(1 * time.Second)
+		}
 	}
 
-	//fmt.Printf("Chunks stored successfully at: %s, total size: %d bytes\n", storageURL, result.TotalSize)
-	return result.TotalSize
+	return fmt.Errorf("超级块上传失败 [%s]，已尝试 %d 次", sc.FileHash, maxRetries+1)
+}
 
-	//fmt.Println("Chunks stored successfully at:", storageURL)
+// storeFileChunks 函数：将非重复块的超级块数据并发上传到对应存储节点
+func storeFileChunks(fileInfo FileInfo) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failedChunks []string
+
+	concurrency := 8
+	sem := make(chan struct{}, concurrency)
+
+	for _, superChunk := range fileInfo.SuperChunks {
+		wg.Add(1)
+		sem <- struct{}{} // 占用一个名额
+
+		go func(sc SuperChunk) {
+			defer wg.Done()
+			defer func() { <-sem }() // 释放名额
+
+			err := uploadSuperChunkWithRetry(sc, 2) // 最多重试 2 次
+			if err != nil {
+				mu.Lock()
+				failedChunks = append(failedChunks, sc.FileHash)
+				mu.Unlock()
+			}
+		}(superChunk)
+	}
+
+	wg.Wait()
+
+	// 输出失败信息
+	if len(failedChunks) > 0 {
+		log.Printf("以下超级块上传失败（共 %d 个）：\n%v", len(failedChunks), failedChunks)
+	}
 }
 
 // processDataset 函数：处理数据集文件夹中的所有文件
 func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) {
 	// 遍历数据集文件夹
+	processedFile := 0
 	files, err := os.ReadDir(datasetDir)
 	if err != nil {
 		log.Fatal("Failed to read dataset directory:", err)
 	}
 
 	var (
-		wg            sync.WaitGroup // 用于等待所有 Goroutines 完成
-		totalFiles    int            // 总文件数
-		totalFileSize int64          // 总文件大小
-		totalDataSize int64          // 各存储节点存储的数据大小
-		startTime     = time.Now()   // 开始时间
+		wg                sync.WaitGroup // 用于等待所有 Goroutines 完成
+		totalFiles        int            // 总文件数
+		processedFileSize int64          // 总文件大小
+		totalDataSize     int64          // 各存储节点存储的数据大小
+		startTime         = time.Now()   // 开始时间
 	)
 
 	// 创建一个有缓冲的通道，用于控制并发数量
@@ -318,12 +358,13 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 				log.Printf("Failed to get file info %s: %v\n", filePath, err)
 				continue
 			}
-			totalFileSize += fileInfo.Size()
+			processedFileSize += fileInfo.Size()
 
 			wg.Add(1)
 			concurrencyLimit <- struct{}{} // 占用一个并发槽
 
 			go func(filePath string, fileName string) {
+
 				defer wg.Done()
 				defer func() { <-concurrencyLimit }() // 释放一个并发槽
 
@@ -342,23 +383,27 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 				}
 
 				// 发送文件信息到元数据服务器，检查文件是否重复
-				isDuplicate := sendFileInfo(fileInfo)
+				isDuplicate, fileInfoWithUrl := sendFileInfo(fileInfo)
 				if isDuplicate {
 					//fmt.Printf("文件 %s 是重复的，跳过备份。\n", fileName)
 					return
 				}
 
 				// 将超级块发送到元数据服务器进行路由
-				for _, superChunk := range fileInfo.SuperChunks {
-					storageURL, nonDuplicateHashes := routeSuperChunk(superChunk)
-					storeChunks(storageURL, superChunk.Chunks, nonDuplicateHashes, superChunk.FileType)
+				storeFileChunks(fileInfoWithUrl)
+				mu.Lock()
+				processedFile++
+				if processedFile%int(len(files)/4) == 0 {
+					fmt.Printf("已处理%d个文件/总文件数%d\n", processedFile, len(files))
 				}
+				mu.Unlock()
+
 			}(filePath, file.Name())
 		}
 	}
-
 	// 等待所有 Goroutines 完成
 	wg.Wait()
+	fmt.Println("文件处理完成")
 
 	// 获取并展示所有存储节点的信息
 	storageInfo, err := getAllStorageInfo()
@@ -369,7 +414,7 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 
 	fmt.Println("\n存储服务器信息：")
 	fmt.Printf("存储服务器个数: %d \n", len(storageInfo.Nodes))
-	totalDataSize = storageInfo.TotalSize
+
 	maxLoad := storageInfo.Nodes[0].Load
 	minLoad := storageInfo.Nodes[0].Load
 	storageInfoLog := ""
@@ -382,29 +427,36 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 		if node.Load < minLoad {
 			minLoad = node.Load
 		}
+		totalDataSize += node.Load
 	}
 	fmt.Printf("数据倾斜率: %.5f\n", float64(maxLoad)/float64(minLoad))
 
 	// 计算吞吐量和重删率
 	elapsedTime := time.Since(startTime).Seconds()
-	throughput := float64(totalFileSize) / elapsedTime / 1024 / 1024 // 吞吐量（MB/s）
+	throughput := float64(processedFileSize) / elapsedTime / 1024 / 1024 // 吞吐量（MB/s）
 
 	// 输出统计信息
+	fmt.Printf("并发上传线程数: %d\n", maxConcurrency)
 	fmt.Printf("总文件数: %d\n", totalFiles)
-	fmt.Printf("总文件大小: %d MB\n", totalFileSize/1024/1024)
+	fmt.Printf("总文件大小: %d MB\n", processedFileSize/1024/1024)
 	fmt.Printf("各存储服务器总存储消耗量: %d MB\n", totalDataSize/1024/1024)
 	fmt.Printf("吞吐量: %.2f MB/s\n", throughput)
-	absoluteDedupRatio = float64(totalFileSize) / float64(totalDataSize)
+	absoluteDedupRatio = float64(storageInfo.TotalFileSize) / float64(totalDataSize)
 	if len(storageInfo.Nodes) == 1 { //单节点，计算绝对重删率
 		oneNodeAbsoluteDedupRatio = absoluteDedupRatio
-		fmt.Printf("单节点绝对重删率: %.5f\n", oneNodeAbsoluteDedupRatio)
+		if totalDataSize < processedFileSize {
+			fmt.Printf("单节点绝对重删率: %.5f\n", oneNodeAbsoluteDedupRatio)
+		}
+
 	} else {
 		haveRunSingleNode := "相对"
 		if oneNodeAbsoluteDedupRatio == 1 { //如果没测过单点则无法计算多节点相对重删率，只能算绝对重删率
 			haveRunSingleNode = "绝对"
 		}
-		relativeDedupRatio = (float64(totalFileSize) / float64(totalDataSize)) / oneNodeAbsoluteDedupRatio // 多节点相对重删率=多节点绝对重删率/单节点系统的绝对重删率
-		fmt.Printf("%d节点%s重删率: %.5f\n\n", len(storageInfo.Nodes), haveRunSingleNode, relativeDedupRatio)
+		relativeDedupRatio = absoluteDedupRatio / oneNodeAbsoluteDedupRatio // 多节点相对重删率=多节点绝对重删率/单节点系统的绝对重删率
+		if totalDataSize < processedFileSize {
+			fmt.Printf("%d节点%s重删率: %.5f\n\n", len(storageInfo.Nodes), haveRunSingleNode, relativeDedupRatio)
+		}
 	}
 
 	// 将结果追加到本地文件
@@ -421,19 +473,24 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 	// 格式化输出并写入文件，包含时间戳
 	result := fmt.Sprintf("[%s] 上传完成！\n存储服务器个数: %d \n%s", currentTime, len(storageInfo.Nodes), storageInfoLog)
 	result += fmt.Sprintf("数据倾斜率: %.5f\n", float64(maxLoad)/float64(minLoad))
+	result += fmt.Sprintf("并发上传线程数: %d\n", maxConcurrency)
 	result += fmt.Sprintf("总文件数: %d\n", totalFiles)
-	result += fmt.Sprintf("总文件大小: %d MB\n", totalFileSize/1024/1024)
+	result += fmt.Sprintf("总文件大小: %d MB\n", processedFileSize/1024/1024)
 	result += fmt.Sprintf("各存储服务器总存储消耗量: %d MB\n", totalDataSize/1024/1024)
 	result += fmt.Sprintf("吞吐量: %.2f MB/s\n", throughput)
 	if len(storageInfo.Nodes) == 1 { //单节点，计算绝对重删率
-		result += fmt.Sprintf("单节点绝对重删率: %.5f\n\n", oneNodeAbsoluteDedupRatio)
+		if totalDataSize < processedFileSize {
+			result += fmt.Sprintf("单节点绝对重删率: %.5f\n\n", oneNodeAbsoluteDedupRatio)
+		}
 	} else {
 		haveRunSingleNode := "相对"
 		if absoluteDedupRatio == 1 { //如果没测过单点则无法计算多节点相对重删率，只能结算绝对重删率
 			haveRunSingleNode = "绝对"
 		}
-		relativeDedupRatio = (float64(totalFileSize) / float64(totalDataSize)) / oneNodeAbsoluteDedupRatio // 多节点相对重删率=多节点绝对重删率/单节点系统的绝对重删率
-		result += fmt.Sprintf("%d节点%s重删率: %.5f\n\n", len(storageInfo.Nodes), haveRunSingleNode, relativeDedupRatio)
+		relativeDedupRatio = absoluteDedupRatio / oneNodeAbsoluteDedupRatio // 多节点相对重删率=多节点绝对重删率/单节点系统的绝对重删率
+		if totalDataSize < processedFileSize {
+			result += fmt.Sprintf("%d节点%s重删率: %.5f\n\n", len(storageInfo.Nodes), haveRunSingleNode, relativeDedupRatio)
+		}
 	}
 	if _, err := file.WriteString(result); err != nil {
 		fmt.Println("写入文件失败:", err)
@@ -442,32 +499,33 @@ func processDataset(maxConcurrency int) (int64, int, float64, float64, float64) 
 
 	fmt.Println("结果已追加到 result.log 文件中")
 
-	return totalFileSize, len(storageInfo.Nodes), float64(maxLoad) / float64(minLoad), relativeDedupRatio, absoluteDedupRatio
+	return processedFileSize, len(storageInfo.Nodes), float64(maxLoad) / float64(minLoad), relativeDedupRatio, absoluteDedupRatio
 }
 
 // getAllStorageInfo 函数：调用元数据服务器的 getAllStorageInfo 接口，获取所有存储节点的信息
 func getAllStorageInfo() (struct {
-	TotalSize int64         `json:"totalSize"`
-	Nodes     []StorageInfo `json:"nodes"`
+	TotalFileSize int64         `json:"totalFilesSize"`
+	Nodes         []StorageInfo `json:"nodes"`
 }, error) {
 	url := metadataServerURL + "/getAllStorageInfo"
 	resp, err := http.Get(url)
 	if err != nil {
 		return struct {
-			TotalSize int64         `json:"totalSize"`
-			Nodes     []StorageInfo `json:"nodes"`
+			TotalFileSize int64         `json:"totalFilesSize"`
+			Nodes         []StorageInfo `json:"nodes"`
 		}{}, fmt.Errorf("调用元数据服务器失败: %v", err)
 	}
 	defer resp.Body.Close()
 
+	//解析响应
 	var result struct {
-		TotalSize int64         `json:"totalSize"`
-		Nodes     []StorageInfo `json:"nodes"`
+		TotalFileSize int64         `json:"totalFilesSize"`
+		Nodes         []StorageInfo `json:"nodes"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return struct {
-			TotalSize int64         `json:"totalSize"`
-			Nodes     []StorageInfo `json:"nodes"`
+			TotalFileSize int64         `json:"totalFilesSize"`
+			Nodes         []StorageInfo `json:"nodes"`
 		}{}, fmt.Errorf("解析响应失败: %v", err)
 	}
 
@@ -477,6 +535,7 @@ func getAllStorageInfo() (struct {
 // restoreFile 函数：根据文件名恢复文件到本地 download 文件夹
 func restoreFile(fileName string, concurrency int) (int64, int, error) {
 
+	startTime := time.Now()
 	fileSize := int64(0)
 	// 创建 download 文件夹
 	downloadDir := "./download"
@@ -560,7 +619,7 @@ func restoreFile(fileName string, concurrency int) (int64, int, error) {
 
 	// 多线程模拟多客户端并发恢复
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
+	for i := 1; i < concurrency; i++ {
 		wg.Add(1)
 		go func(superChunks []SuperChunk) {
 			defer wg.Done()
@@ -589,9 +648,13 @@ func restoreFile(fileName string, concurrency int) (int64, int, error) {
 		}(fileInfo.SuperChunks)
 	}
 	wg.Wait()
+	processedFileSize := fileSize * int64(concurrency)
+	elapsedTime := time.Since(startTime).Seconds()
+	throughput := float64(processedFileSize) / elapsedTime / 1024 / 1024 // 吞吐量（MB/s）
 
-	fmt.Println("总大小：", fileSize*int64(concurrency))
+	fmt.Println("总大小：", processedFileSize/1024/1024, "MB")
 	fmt.Println("并发量：", concurrency)
+	fmt.Printf("吞吐量：%.2fMB/s\n", throughput)
 	return fileSize * int64(concurrency), len(storageInfo.Nodes), nil
 }
 

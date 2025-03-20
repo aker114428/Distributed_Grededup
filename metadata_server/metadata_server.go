@@ -30,8 +30,10 @@ type SuperChunk struct {
 
 // Chunk 结构体：表示一个文件块
 type Chunk struct {
-	Offset int64  `json:"offset"`
-	Hash   string `json:"hash"`
+	Offset      int64  `json:"offset"`
+	Hash        string `json:"hash"`
+	Data        []byte `json:"data"`        // 块的二进制数据
+	IsDuplicate bool   `json:"isDuplicate"` // 块是否已存在
 }
 
 // // FileManifest 结构体：记录文件的超级块信息
@@ -50,7 +52,7 @@ type StorageNode struct {
 // MetadataServer 结构体：元数据服务器，负责文件索引和路由
 type MetadataServer struct {
 	FileHashIndex   map[string]FileInfo // 文件哈希索引文件信息
-	FileIndex       map[string]string   // 文件名索引文件哈希，不同文件名可能映射到同一个文件内容
+	FileNameIndex   map[string]string   // 文件名索引文件哈希，不同文件名可能映射到同一个文件内容
 	StorageNodes    []StorageNode       // 存储服务器列表
 	FileTypeToNodes map[string][]string // 文件类型到存储服务器的映射表
 	mu              sync.Mutex          // 互斥锁
@@ -59,35 +61,43 @@ type MetadataServer struct {
 // NewMetadataServer 函数：初始化元数据服务器
 func NewMetadataServer() *MetadataServer {
 	return &MetadataServer{
-		FileIndex:       make(map[string]string),
+		FileNameIndex:   make(map[string]string),
 		FileHashIndex:   make(map[string]FileInfo),
 		StorageNodes:    []StorageNode{},
 		FileTypeToNodes: make(map[string][]string),
 	}
 }
 
-// checkFileDuplicate 函数：检查文件是否重复
-func (m *MetadataServer) checkFileDuplicate(w http.ResponseWriter, r *http.Request) {
-	var reFileInfo FileInfo
-	json.NewDecoder(r.Body).Decode(&reFileInfo)
+// 根据文件信息检查是否重复，不重复则路由超块，返回含存储地址信息和重复块信息的FileInfo
+func (m *MetadataServer) processFileInfo(w http.ResponseWriter, r *http.Request) {
+	var fileInfo FileInfo
+	json.NewDecoder(r.Body).Decode(&fileInfo)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.FileHashIndex[reFileInfo.Hash]; exists {
+	if _, exists := m.FileHashIndex[fileInfo.Hash]; exists {
+		m.mu.Unlock()
+		// 文件重复，直接返回
+		fileInfo.Name = "isDuplicate"
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(true)
+		json.NewEncoder(w).Encode(fileInfo)
 		return
 	}
 
 	// 创建文件清单
-	fileInfo := reFileInfo
-	fileInfo.SuperChunks = []SuperChunk{} //这时还不知道每个超块路由到哪个节点
 	m.FileHashIndex[fileInfo.Hash] = fileInfo
-	m.FileIndex[fileInfo.Name] = fileInfo.Hash
+	m.FileNameIndex[fileInfo.Name] = fileInfo.Hash
+	m.mu.Unlock()
 
+	for i, superChunk := range fileInfo.SuperChunks {
+		superChunkWithUrl := routeSuperChunk(m, superChunk)
+		fileInfo.SuperChunks[i] = superChunkWithUrl
+	}
+	//更新文件超块信息
+	m.mu.Lock()
+	m.FileHashIndex[fileInfo.Hash] = fileInfo
+	m.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(false)
+	json.NewEncoder(w).Encode(fileInfo)
 }
 
 // 用于字符串数组去重
@@ -100,14 +110,10 @@ func contains(slice []string, str string) bool {
 	return false
 }
 
-// routeSuperChunk 函数：发送超级块信息到存储服务器，根据负载均衡和相似度返回最佳节点和非重复块的哈希值
-func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request) {
-	var superChunk SuperChunk
-	if err := json.NewDecoder(r.Body).Decode(&superChunk); err != nil {
-		http.Error(w, "Failed to decode request body", http.StatusBadRequest)
-		return
-	}
+// 发送超级块信息到存储服务器，根据负载均衡和相似度返回最佳节点和非重复块的哈希值
+func routeSuperChunk(m *MetadataServer, superChunk SuperChunk) SuperChunk {
 
+	matchCount := 0
 	m.mu.Lock()
 	var selectedNodeUrl string
 	minNode := &m.StorageNodes[0]
@@ -120,34 +126,22 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 	candidateNodesUrl := m.FileTypeToNodes[superChunk.FileType]
 	m.mu.Unlock()
 
-	duplicateHashes := []string{}
-
 	if len(candidateNodesUrl) == 0 {
 		// 如果没有存储该类型的服务器，选择负载最小的服务器
 		selectedNodeUrl = minNode.URL
 	} else {
-		// 查询候选存储服务器，获取重复块的数量计算相似度
 		// 查询候选存储服务器，获取重复块的数量计算相似度（并发版）
 		var (
-			bestMatchNodeUrl string
-			matchCount       int
-			duplicateHashes  []string
-			mutex            sync.Mutex
-			wg               sync.WaitGroup
+			bestMatchNodeUrl    string
+			candidateSuperChunk SuperChunk
+			mutex               sync.Mutex
+			wg                  sync.WaitGroup
 		)
 
-		requestBody := struct {
-			FileType string   `json:"fileType"`
-			Hashes   []string `json:"hashes"`
-		}{
-			FileType: superChunk.FileType,
-			Hashes:   superChunk.RepresentativeHashes,
-		}
-
-		jsonData, err := json.Marshal(requestBody)
+		jsonData, err := json.Marshal(superChunk)
 		if err != nil {
-			http.Error(w, "Failed to marshal hashes", http.StatusInternalServerError)
-			return
+			log.Printf("Failed to marshal hashes")
+			return SuperChunk{}
 		}
 
 		for _, nodeURL := range candidateNodesUrl {
@@ -155,7 +149,7 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 			go func(nodeURL string) {
 				defer wg.Done()
 
-				url := fmt.Sprintf("%s/checkChunks", nodeURL)
+				url := fmt.Sprintf("%s/checkSuperChunks", nodeURL)
 				resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 				if err != nil {
 					log.Printf("Failed to check chunks from %s: %v", nodeURL, err)
@@ -164,8 +158,8 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 				defer resp.Body.Close()
 
 				var result struct {
-					MatchCount      int      `json:"matchCount"`
-					DuplicateHashes []string `json:"duplicateHashes"`
+					MatchCount int        `json:"matchCount"`
+					SuperChunk SuperChunk `json:"superChunk"`
 				}
 				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 					log.Printf("Failed to decode response from %s: %v", nodeURL, err)
@@ -176,21 +170,21 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 				defer mutex.Unlock()
 				if result.MatchCount > matchCount {
 					matchCount = result.MatchCount
-					duplicateHashes = result.DuplicateHashes
+					candidateSuperChunk = result.SuperChunk
 					bestMatchNodeUrl = nodeURL
 				}
 			}(nodeURL)
 		}
 		wg.Wait()
 
-		if len(duplicateHashes) == 0 { // 相似度都为 0
+		if matchCount == 0 { // 相似度都为 0
 			var minWeight int64
 			var minLoadNodeUrl string
 			isFirst := true
 			m.mu.Lock()
 			for _, nodeURL := range candidateNodesUrl { // 获取候选服务器中负载最小的节点
 				for i := range m.StorageNodes {
-					if m.StorageNodes[i].URL == nodeURL {
+					if m.StorageNodes[i].URL == nodeURL { //从StorageNodes中找候选服务器信息
 						if isFirst {
 							minWeight = m.StorageNodes[i].Load
 							minLoadNodeUrl = nodeURL
@@ -204,41 +198,25 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 				}
 			}
 			m.mu.Unlock()
-			if minNode.Load != 0 && float32(minWeight)/float32(minNode.Load) < 1.5 { // 不会破坏负载均衡
+			if minNode.Load != 0 && float32(minWeight)+40/float32(minNode.Load) < 1.2 { // 不会破坏负载均衡
 				selectedNodeUrl = minLoadNodeUrl
 			} else { // 会破坏负载均衡
 				selectedNodeUrl = minNode.URL
 			}
 		} else { // 相似度不为 0
 			selectedNodeUrl = bestMatchNodeUrl
-		}
-	}
-	// 计算需要存储的非重复块的哈希值
-	nonDuplicateHashes := make([]string, 0)
-	for _, hash := range superChunk.RepresentativeHashes {
-		isDuplicate := false
-		for _, dupHash := range duplicateHashes {
-			if hash == dupHash {
-				isDuplicate = true
-				break
-			}
-		}
-		if !isDuplicate {
-			nonDuplicateHashes = append(nonDuplicateHashes, hash)
+			superChunk = candidateSuperChunk
 		}
 	}
 
-	m.mu.Lock()
-	//更新文件超块信息
 	superChunk.StorageURL = selectedNodeUrl
-	fileInfo := m.FileHashIndex[superChunk.FileHash] // 从映射中获取结构体的副本
-	fileInfo.SuperChunks = append(fileInfo.SuperChunks, superChunk)
-	m.FileHashIndex[superChunk.FileHash] = fileInfo
+
+	m.mu.Lock()
 	// 更新存储服务器负载和文件类型
 	for i := range m.StorageNodes {
 		if m.StorageNodes[i].URL == selectedNodeUrl {
-			m.StorageNodes[i].Load += int64(len(nonDuplicateHashes))         //暂时按数据块的个数作为负载
-			if !contains(m.StorageNodes[i].FileTypes, superChunk.FileType) { //重复的类型就不插入了
+			m.StorageNodes[i].Load += int64(len(superChunk.Chunks) - matchCount) //暂时按数据块的个数作为负载
+			if !contains(m.StorageNodes[i].FileTypes, superChunk.FileType) {     //重复的类型就不插入了
 				m.StorageNodes[i].FileTypes = append(m.StorageNodes[i].FileTypes, superChunk.FileType)
 			}
 			break
@@ -250,15 +228,7 @@ func (m *MetadataServer) routeSuperChunk(w http.ResponseWriter, r *http.Request)
 	}
 	m.mu.Unlock()
 
-	// 返回最佳节点和非重复块的哈希值
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(struct {
-		StorageURL         string   `json:"storageURL"`
-		NonDuplicateHashes []string `json:"nonDuplicateHashes"`
-	}{
-		StorageURL:         selectedNodeUrl,
-		NonDuplicateHashes: nonDuplicateHashes,
-	})
+	return superChunk
 }
 
 // handleRegister 函数：处理存储节点注册请求
@@ -322,7 +292,7 @@ func (m *MetadataServer) clean(w http.ResponseWriter, r *http.Request) {
 
 	// 清除本地元数据
 	m.FileHashIndex = make(map[string]FileInfo)
-	m.FileIndex = make(map[string]string)
+	m.FileNameIndex = make(map[string]string)
 	m.FileTypeToNodes = make(map[string][]string)
 
 	// 并发调用所有存储服务器的 clean 接口
@@ -368,8 +338,6 @@ func (m *MetadataServer) clean(w http.ResponseWriter, r *http.Request) {
 
 // getAllStorageInfo 函数：调用所有存储服务器的 getStorageSize 接口，并汇总信息
 func (m *MetadataServer) getAllStorageInfo(w http.ResponseWriter, r *http.Request) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// 并发调用所有存储服务器的 getStorageSize 接口
 	var wg sync.WaitGroup
@@ -390,38 +358,40 @@ func (m *MetadataServer) getAllStorageInfo(w http.ResponseWriter, r *http.Reques
 
 			// 解析响应
 			var result struct {
-				TotalSize int64    `json:"totalSize"`
-				FileTypes []string `json:"fileTypes"`
+				TotalDataSize int64    `json:"totalDataSize"`
+				FileTypes     []string `json:"fileTypes"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 				log.Printf("解析存储服务器 %s 的响应失败: %v\n", nodeURL, err)
 				return
 			}
-
+			m.mu.Lock()
 			// 存储结果
 			storageInfos[i] = StorageNode{
 				URL:       nodeURL,
-				Load:      result.TotalSize,
+				Load:      result.TotalDataSize,
 				FileTypes: result.FileTypes,
 			}
+			m.mu.Unlock()
+			fmt.Println("存储节点信息：",storageInfos[i])
 		}(i, node.URL)
 	}
 	wg.Wait()
 
-	// 汇总所有存储服务器的信息
-	var totalSize int64
-	for _, info := range storageInfos {
-		totalSize += info.Load
+	// 总文件大小信息
+	var totalFilesSize int64
+	for _, file := range m.FileHashIndex {
+		totalFilesSize += file.Size
 	}
 
 	// 返回汇总结果
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(struct {
-		TotalSize int64         `json:"totalSize"`
-		Nodes     []StorageNode `json:"nodes"`
+		TotalFileSize int64         `json:"totalFilesSize"`
+		Nodes         []StorageNode `json:"nodes"`
 	}{
-		TotalSize: totalSize,
-		Nodes:     storageInfos,
+		TotalFileSize: totalFilesSize,
+		Nodes:         storageInfos,
 	})
 
 	fmt.Println("当前存储节点信息：")
@@ -447,7 +417,7 @@ func (m *MetadataServer) restoreFile(w http.ResponseWriter, r *http.Request) {
 	defer m.mu.Unlock()
 
 	// 查找文件哈希
-	fileHash, exists := m.FileIndex[requestBody.FileName]
+	fileHash, exists := m.FileNameIndex[requestBody.FileName]
 	if !exists {
 		http.Error(w, "文件不存在", http.StatusNotFound)
 		return
@@ -469,8 +439,7 @@ func main() {
 	metadataServer := NewMetadataServer()
 
 	// 注册路由
-	http.HandleFunc("/checkFileDuplicate", metadataServer.checkFileDuplicate)
-	http.HandleFunc("/routeSuperChunk", metadataServer.routeSuperChunk)
+	http.HandleFunc("/processFileInfo", metadataServer.processFileInfo)
 	http.HandleFunc("/register", metadataServer.handleRegister)
 	http.HandleFunc("/getAllStorageInfo", metadataServer.getAllStorageInfo)
 	http.HandleFunc("/clean", metadataServer.clean)

@@ -84,7 +84,7 @@ func startClient(clientControler *ClientControler, operation string, parameter s
 	for i, client := range clientControler.Clients {
 		wg.Add(1)
 		go func(i int, clientURL string, operation string, parameter string, parameter2 string) {
-			fmt.Println("客户端",clientURL,"开始处理文件上传")
+			fmt.Println("start client: ",clientURL)
 			defer wg.Done()
 			url := fmt.Sprintf("%s/startClient", clientURL)
 			// 构造请求体
@@ -100,7 +100,7 @@ func startClient(clientControler *ClientControler, operation string, parameter s
 			if i+1 < len(clientControler.Clients) && operation == "upload" {
 				requestBody.Parameter = "4" //默认上传线程数为4
 			}
-			if i+1 < len(clientControler.Clients) && operation == "upload" {
+			if i+1 < len(clientControler.Clients) && operation == "restore" {
 				requestBody.Parameter2 = "4" //默认恢复线程数为4
 			}
 			jsonData, _ := json.Marshal(requestBody)
@@ -181,7 +181,7 @@ func startClient(clientControler *ClientControler, operation string, parameter s
 			"restore",
 			totalSize,
 			nodeNum,                          // 存储服务器数量
-			4*(nodeNum-1)+concurrentQuantity, // 上传并发参数
+			4*(clientNum-1)+concurrentQuantity, // 上传并发参数
 			throughputFmt,
 			0,
 			0,
