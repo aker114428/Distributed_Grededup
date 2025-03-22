@@ -20,7 +20,7 @@ import (
 var (
 	dataNodePort      string                        // 存储节点的端口号
 	storageDir        = "./data_blocks"             // 存储块的目录
-	metadataServerURL = "http://192.168.1.108:8080" // 元数据服务器的 URL
+	metadataServerURL = "http://192.168.1.203:8080" // 元数据服务器的 URL
 	localURL          string                        // 本机 URL
 )
 
@@ -39,6 +39,23 @@ type Chunk struct {
 	Hash        string `json:"hash"`        // 块的哈希值
 	Data        []byte `json:"data"`        // 块的二进制数据
 	IsDuplicate bool   `json:"isDuplicate"` // 块是否已存在
+}
+
+// StorageServer 结构体：存储服务器，负责存储块
+type StorageServer struct {
+	mu            sync.Mutex // 互斥锁
+	TotalDataSize int64
+	FileTypes     map[string]struct{} //用map模拟集合,存储文件类型
+	ChunkHashes   map[string]struct{} //用map模拟集合,存储hash
+}
+
+// NewStorageServer 函数：初始存储服务器
+func NewStorageServer() *StorageServer {
+	return &StorageServer{
+		TotalDataSize: 0,
+		FileTypes:     make(map[string]struct{}),
+		ChunkHashes:   make(map[string]struct{}),
+	}
 }
 
 // getWLANIP 获取本机的 IP 地址（支持无线网络和有线网络）
@@ -178,21 +195,6 @@ func registerWithMetadataServer() error {
 	return nil
 }
 
-// StorageServer 结构体：存储服务器，负责存储块
-type StorageServer struct {
-	mu            sync.Mutex // 互斥锁
-	TotalDataSize int64
-	FileTypes     map[string]struct{} //用map模拟集合,存储文件类型
-}
-
-// NewStorageServer 函数：初始存储服务器
-func NewStorageServer() *StorageServer {
-	return &StorageServer{
-		TotalDataSize: 0,
-		FileTypes:     make(map[string]struct{}),
-	}
-}
-
 // storeSuperChunks 函数：将块存储到存储服务器
 func (s *StorageServer) storeSuperChunks(w http.ResponseWriter, r *http.Request) {
 	var superChunk SuperChunk
@@ -206,7 +208,7 @@ func (s *StorageServer) storeSuperChunks(w http.ResponseWriter, r *http.Request)
 
 	// 将块存储到对应类型的文件夹中
 	for _, chunk := range superChunk.Chunks {
-		if chunk.IsDuplicate {//这里重复检查的只有代表指纹
+		if chunk.IsDuplicate { //这里重复检查的只有代表指纹
 			continue
 		}
 		dir := filepath.Join(storageDir, superChunk.FileType)
@@ -236,6 +238,7 @@ func (s *StorageServer) storeSuperChunks(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		s.TotalDataSize += int64(len(chunk.Data))
+		s.ChunkHashes[chunk.Hash] = struct{}{}
 	}
 
 	// 返回存储后的 data_blocks 大小
@@ -244,9 +247,12 @@ func (s *StorageServer) storeSuperChunks(w http.ResponseWriter, r *http.Request)
 
 // checkSuperChunks 函数：根据文件类型，在对应文件夹下检查哈希匹配数量，并返回重复的哈希值
 func (s *StorageServer) checkSuperChunks(w http.ResponseWriter, r *http.Request) {
-	var superChunk SuperChunk
+	var requestData struct {
+		RepresentativeHashes []string `json:"representativeHashes"`
+	}
+	//var superChunk SuperChunk
 	matchCount := 0
-	if err := json.NewDecoder(r.Body).Decode(&superChunk); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
 		http.Error(w, "解析请求体失败", http.StatusBadRequest)
 		return
 	}
@@ -254,13 +260,20 @@ func (s *StorageServer) checkSuperChunks(w http.ResponseWriter, r *http.Request)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 在对应文件类型的文件夹下检查哈希匹配
-	dir := filepath.Join(storageDir, superChunk.FileType)
-	for i := 0; i < len(superChunk.RepresentativeHashes); i++ { //RepresentativeHashes就是取超块中的前len(RepresentativeHashes)个块
-		filePath := filepath.Join(dir, superChunk.Chunks[i].Hash)
-		if _, err := os.Stat(filePath); err == nil {
+	// // 在对应文件类型的文件夹下检查哈希匹配
+	// dir := filepath.Join(storageDir, superChunk.FileType)
+	// for i := 0; i < len(superChunk.RepresentativeHashes); i++ { //RepresentativeHashes就是取超块中的前len(RepresentativeHashes)个块
+	// 	filePath := filepath.Join(dir, superChunk.Chunks[i].Hash)
+	// 	if _, err := os.Stat(filePath); err == nil {
+	// 		matchCount++
+	// 		superChunk.Chunks[i].IsDuplicate = true
+	// 	}
+	// }
+
+	for _, hash := range requestData.RepresentativeHashes {
+		_, exists := s.ChunkHashes[hash]
+		if exists {
 			matchCount++
-			superChunk.Chunks[i].IsDuplicate = true
 		}
 	}
 
@@ -268,10 +281,8 @@ func (s *StorageServer) checkSuperChunks(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(struct {
 		MatchCount int        `json:"matchCount"`
-		SuperChunk SuperChunk `json:"superChunk"`
 	}{
 		MatchCount: matchCount,
-		SuperChunk: superChunk,
 	})
 }
 
@@ -281,6 +292,7 @@ func (s *StorageServer) clean(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	s.FileTypes = make(map[string]struct{})
+	s.ChunkHashes = make(map[string]struct{})
 	s.TotalDataSize = 0
 	// 删除存储目录及其所有内容
 	if err := os.RemoveAll("./data_blocks"); err != nil {
@@ -456,8 +468,6 @@ func (s *StorageServer) getSuperChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	storageServer := NewStorageServer()
-	initStorageServer(storageServer)
 
 	// 捕获退出信号
 	sigChan := make(chan os.Signal, 1)
@@ -497,6 +507,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	storageServer := NewStorageServer()
+	initStorageServer(storageServer)
 	// 启动存储服务器
 
 	http.HandleFunc("/storeSuperChunks", storageServer.storeSuperChunks)

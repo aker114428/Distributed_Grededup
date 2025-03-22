@@ -25,7 +25,7 @@ const (
 )
 
 var (
-	metadataServerURL         = "http://192.168.1.108:8080"
+	metadataServerURL         = "http://192.168.1.203:8080"
 	absoluteDedupRatio        = 1.0 //绝对重删率
 	oneNodeAbsoluteDedupRatio = 1.0 //单节点绝对重删率：重删前文件总大小除以重删后文件总大小
 	relativeDedupRatio        = 1.0 //多节点相对重删率：多节点绝对重删率除以单节点系统的绝对重删率

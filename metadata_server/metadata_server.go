@@ -68,6 +68,7 @@ func NewMetadataServer() *MetadataServer {
 	}
 }
 
+
 // 根据文件信息检查是否重复，不重复则路由超块，返回含存储地址信息和重复块信息的FileInfo
 func (m *MetadataServer) processFileInfo(w http.ResponseWriter, r *http.Request) {
 	var fileInfo FileInfo
@@ -87,7 +88,7 @@ func (m *MetadataServer) processFileInfo(w http.ResponseWriter, r *http.Request)
 	m.FileHashIndex[fileInfo.Hash] = fileInfo
 	m.FileNameIndex[fileInfo.Name] = fileInfo.Hash
 	m.mu.Unlock()
-
+	//路由超级块
 	for i, superChunk := range fileInfo.SuperChunks {
 		superChunkWithUrl := routeSuperChunk(m, superChunk)
 		fileInfo.SuperChunks[i] = superChunkWithUrl
@@ -133,12 +134,16 @@ func routeSuperChunk(m *MetadataServer, superChunk SuperChunk) SuperChunk {
 		// 查询候选存储服务器，获取重复块的数量计算相似度（并发版）
 		var (
 			bestMatchNodeUrl    string
-			candidateSuperChunk SuperChunk
 			mutex               sync.Mutex
 			wg                  sync.WaitGroup
 		)
+		requestData := struct {
+			RepresentativeHashes []string `json:"representativeHashes"`
+		}{
+			RepresentativeHashes: superChunk.RepresentativeHashes,
+		}
 
-		jsonData, err := json.Marshal(superChunk)
+		jsonData, err := json.Marshal(requestData)
 		if err != nil {
 			log.Printf("Failed to marshal hashes")
 			return SuperChunk{}
@@ -159,7 +164,6 @@ func routeSuperChunk(m *MetadataServer, superChunk SuperChunk) SuperChunk {
 
 				var result struct {
 					MatchCount int        `json:"matchCount"`
-					SuperChunk SuperChunk `json:"superChunk"`
 				}
 				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 					log.Printf("Failed to decode response from %s: %v", nodeURL, err)
@@ -170,7 +174,6 @@ func routeSuperChunk(m *MetadataServer, superChunk SuperChunk) SuperChunk {
 				defer mutex.Unlock()
 				if result.MatchCount > matchCount {
 					matchCount = result.MatchCount
-					candidateSuperChunk = result.SuperChunk
 					bestMatchNodeUrl = nodeURL
 				}
 			}(nodeURL)
@@ -205,7 +208,6 @@ func routeSuperChunk(m *MetadataServer, superChunk SuperChunk) SuperChunk {
 			}
 		} else { // 相似度不为 0
 			selectedNodeUrl = bestMatchNodeUrl
-			superChunk = candidateSuperChunk
 		}
 	}
 
@@ -262,6 +264,7 @@ func (m *MetadataServer) handleRegister(w http.ResponseWriter, r *http.Request) 
 
 	fmt.Printf("存储节点注册成功: %+v\n", nodeInfo)
 	fmt.Println("当前存储节点信息：")
+	fmt.Println("存储服务器数量：", len(m.StorageNodes))
 	for _, node := range m.StorageNodes {
 		fmt.Println(node.URL, node.Load, node.FileTypes)
 	}
@@ -330,6 +333,7 @@ func (m *MetadataServer) clean(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "元数据服务器和所有存储服务器的数据已清除")
 	fmt.Println("当前存储节点信息：")
+	fmt.Println("存储服务器数量：", len(m.StorageNodes))
 	for _, node := range m.StorageNodes {
 		fmt.Println(node.URL, node.Load, node.FileTypes)
 	}
@@ -373,7 +377,7 @@ func (m *MetadataServer) getAllStorageInfo(w http.ResponseWriter, r *http.Reques
 				FileTypes: result.FileTypes,
 			}
 			m.mu.Unlock()
-			fmt.Println("存储节点信息：",storageInfos[i])
+			fmt.Println("存储节点信息：", storageInfos[i])
 		}(i, node.URL)
 	}
 	wg.Wait()
@@ -444,7 +448,9 @@ func main() {
 	http.HandleFunc("/getAllStorageInfo", metadataServer.getAllStorageInfo)
 	http.HandleFunc("/clean", metadataServer.clean)
 	http.HandleFunc("/restoreFile", metadataServer.restoreFile)
+
+
+	fmt.Printf("元数据服务器运行在8080端口...\n")
 	// 启动元数据服务器
-	fmt.Println("元数据服务器运行在端口 8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
